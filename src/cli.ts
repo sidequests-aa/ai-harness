@@ -330,7 +330,7 @@ async function main() {
     t: 'stage.exit',
     stage: 'review',
     durationMs: Date.now() - stage6Start,
-    ok: reviewerVerdict?.verdict !== null,
+    ok: !!reviewerVerdict?.verdict,
   });
   if (reviewerVerdict?.verdict) {
     logger.log({

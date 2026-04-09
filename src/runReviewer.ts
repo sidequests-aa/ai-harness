@@ -79,45 +79,61 @@ export async function runReviewer({ ticket, cwd, model }: RunReviewerOpts): Prom
   // eslint-disable-next-line no-console
   console.log(`[reviewer] starting in ${cwd}`);
 
-  for await (const message of query({
-    prompt: `Review the implementer's work against the acceptance criteria below and return your verdict as structured JSON.
+  // Wrap the iterator in try/catch so SDK errors (e.g. maxTurns reached)
+  // don't crash the harness — the cli will surface a "no verdict" reason
+  // in the escalation PR rather than blowing up.
+  try {
+    for await (const message of query({
+      prompt: `Review the implementer's work against the acceptance criteria below and return your verdict as structured JSON.
 
 Acceptance criteria:
 ${ticket.acceptanceCriteria.map((ac) => `- **${ac.id}**: ${ac.text}`).join('\n')}
 
 Use \`git diff main\` (from this directory) to see what changed, then \`Read\`/\`Grep\` the changed files to verify each criterion. Cite file:line in the evidence field.`,
-    options: {
-      cwd,
-      systemPrompt,
-      allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
-      permissionMode: 'default',
-      maxTurns: 20,
-      outputFormat: { type: 'json_schema', schema },
-      ...(model ? { model } : {}),
-    },
-  })) {
-    const m = message as Record<string, unknown> & { type: string };
-    if (m.type === 'result') {
-      const r = m as {
-        subtype?: string;
-        result?: string;
-        total_cost_usd?: number;
-        num_turns?: number;
-        structured_output?: unknown;
-      };
-      costUsd = r.total_cost_usd ?? 0;
-      turns = r.num_turns ?? 0;
-      rawText = r.result ?? '';
-      if (r.structured_output) {
-        const parsed = ReviewVerdictSchema.safeParse(r.structured_output);
-        if (parsed.success) {
-          verdict = parsed.data;
-        } else {
-          // eslint-disable-next-line no-console
-          console.warn('[reviewer] structured_output failed schema validation:', parsed.error.message);
+      options: {
+        cwd,
+        systemPrompt,
+        allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+        permissionMode: 'default',
+        // 12 ACs to verify, each potentially 1-2 file reads, plus the
+        // structured-output formulation step at the end. 40 turns leaves
+        // headroom; the budget is enforced post-hoc by the cli.
+        maxTurns: 40,
+        outputFormat: { type: 'json_schema', schema },
+        ...(model ? { model } : {}),
+      },
+    })) {
+      const m = message as Record<string, unknown> & { type: string };
+      if (m.type === 'result') {
+        const r = m as {
+          subtype?: string;
+          result?: string;
+          total_cost_usd?: number;
+          num_turns?: number;
+          structured_output?: unknown;
+        };
+        costUsd = r.total_cost_usd ?? 0;
+        turns = r.num_turns ?? 0;
+        rawText = r.result ?? '';
+        if (r.structured_output) {
+          const parsed = ReviewVerdictSchema.safeParse(r.structured_output);
+          if (parsed.success) {
+            verdict = parsed.data;
+          } else {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[reviewer] structured_output failed schema validation:',
+              parsed.error.message,
+            );
+          }
         }
       }
     }
+  } catch (err) {
+    const message = (err as Error).message ?? String(err);
+    // eslint-disable-next-line no-console
+    console.warn(`[reviewer] SDK error: ${message}`);
+    // verdict stays null; cli sees this and opens a draft escalation PR
   }
 
   // eslint-disable-next-line no-console
