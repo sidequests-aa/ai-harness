@@ -227,6 +227,7 @@ async function main() {
   const result = await runAgent({
     ticket,
     cwd: agentCwd,
+    worktreePath: wt.path,
     packsDir,
     repoMapRoot,
     ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
@@ -352,14 +353,25 @@ async function main() {
   console.log('[stage 7] worktree has changes — committing');
   commitAll(wt.path, `harness(${runId}): ${ticket.title}`);
 
-  // Determine escalation status. The PR is "approved" if the reviewer
-  // verdict is approved AND all run_gates passed AND the agent didn't hit
-  // any hard hook denials. Otherwise it's a draft escalation.
+  // Determine escalation status. The PR is "approved" only if every
+  // failure-mode signal is clean. Each branch of the reason cascade matches
+  // a specific failure mode the harness defends against — explicit signals,
+  // not vibes.
+  const costOver = result.totalCostUsd > ticket.budgets.maxCostUSD;
+  const turnsOver = result.numTurns >= ticket.budgets.maxTurns;
+  const wallOver = result.durationMs > ticket.budgets.maxWallSeconds * 1000;
+  const stuckHard = result.hookEvents.stuckEvents.some((e) => e.strike >= 2);
+
   const approved =
     reviewerVerdict?.verdict?.approved === true &&
     (result.finalGateResult?.ok ?? false) &&
     result.hookEvents.scopeDenials.length === 0 &&
-    result.hookEvents.importDenials.length === 0;
+    result.hookEvents.importDenials.length === 0 &&
+    !costOver &&
+    !turnsOver &&
+    !wallOver &&
+    !stuckHard;
+
   const escalationReason = !approved
     ? !reviewerVerdict?.verdict
       ? 'no reviewer verdict'
@@ -369,7 +381,17 @@ async function main() {
       ? 'run_gates ladder failed or was not invoked'
       : result.hookEvents.scopeDenials.length > 0
       ? `${result.hookEvents.scopeDenials.length} scope-guard denials`
-      : `${result.hookEvents.importDenials.length} hallucinated imports caught`
+      : result.hookEvents.importDenials.length > 0
+      ? `${result.hookEvents.importDenials.length} hallucinated imports caught`
+      : costOver
+      ? `cost $${result.totalCostUsd.toFixed(4)} exceeded budget $${ticket.budgets.maxCostUSD.toFixed(2)}`
+      : turnsOver
+      ? `turn budget exhausted (${result.numTurns}/${ticket.budgets.maxTurns})`
+      : wallOver
+      ? `wall budget exceeded (${(result.durationMs / 1000).toFixed(0)}s / ${ticket.budgets.maxWallSeconds}s)`
+      : stuckHard
+      ? 'stuck-loop (Stop hook detected zero diff progress over 2+ stop attempts)'
+      : 'unknown'
     : undefined;
 
   const reportInput = {

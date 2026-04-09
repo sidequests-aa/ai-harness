@@ -14,6 +14,7 @@ import type { HookCallbackMatcher, HookEvent } from '@anthropic-ai/claude-agent-
 import { createScopeGuardHook } from './scopeGuard';
 import { createImportAuditHook } from './importAudit';
 import { createFastGateHook } from './fastGate';
+import { createStopProgressHook } from './stopProgress';
 
 export interface ScopeDenyEvent {
   tool: string;
@@ -34,18 +35,30 @@ export interface FastGateFailureEvent {
   output: string;
 }
 
+export interface StuckEvent {
+  strike: 1 | 2;
+  diffHash: string;
+}
+
 export interface HookCollectors {
   scopeDenials: ScopeDenyEvent[];
   importDenials: ImportAuditDenyEvent[];
   fastGateFailures: FastGateFailureEvent[];
+  stuckEvents: StuckEvent[];
 }
 
 export function createHookCollectors(): HookCollectors {
-  return { scopeDenials: [], importDenials: [], fastGateFailures: [] };
+  return { scopeDenials: [], importDenials: [], fastGateFailures: [], stuckEvents: [] };
 }
 
 export interface BuildHooksOpts {
   agentCwd: string;
+  /**
+   * The git worktree root. Usually the parent of `agentCwd` (since the
+   * agent's CWD is the seed subfolder of the worktree). Used by the Stop
+   * hook for `git diff HEAD`.
+   */
+  worktreePath: string;
   fileScope: string[];
   collectors: HookCollectors;
 }
@@ -58,6 +71,7 @@ export interface BuildHooksOpts {
  * - `PreToolUse` matcher `Write|Edit|NotebookEdit|Bash` → scope-guard (G5)
  * - `PreToolUse` matcher `Write|Edit` → import-audit (G4)
  * - `PostToolUse` matcher `Write|Edit` → fast-gate (G1+G2)
+ * - `Stop` (no matcher) → stop-progress stuck-loop detector
  *
  * Two PreToolUse matchers run sequentially; if scope-guard denies, the
  * tool call short-circuits before import-audit runs.
@@ -76,6 +90,10 @@ export function buildHooks(opts: BuildHooksOpts): Partial<Record<HookEvent, Hook
     agentCwd: opts.agentCwd,
     onFailure: (info) => opts.collectors.fastGateFailures.push(info),
   });
+  const stopProgress = createStopProgressHook({
+    worktreePath: opts.worktreePath,
+    onStuck: (info) => opts.collectors.stuckEvents.push(info),
+  });
 
   return {
     PreToolUse: [
@@ -83,9 +101,11 @@ export function buildHooks(opts: BuildHooksOpts): Partial<Record<HookEvent, Hook
       { matcher: 'Write|Edit', hooks: [importAudit] },
     ],
     PostToolUse: [{ matcher: 'Write|Edit', hooks: [fastGate] }],
+    Stop: [{ hooks: [stopProgress] }],
   };
 }
 
 export { createScopeGuardHook } from './scopeGuard';
 export { createImportAuditHook } from './importAudit';
 export { createFastGateHook } from './fastGate';
+export { createStopProgressHook } from './stopProgress';

@@ -33,6 +33,12 @@ interface RunAgentOpts {
    */
   cwd: string;
   /**
+   * Absolute path to the git worktree root. The Stop hook runs `git diff
+   * HEAD` against this path to detect stuck loops. Usually the parent of
+   * `cwd` (since `cwd` is the seed subfolder).
+   */
+  worktreePath: string;
+  /**
    * Absolute path to the directory containing curated context packs.
    * Defaults to `<harness-root>/context-packs/medplum`.
    */
@@ -69,6 +75,7 @@ interface RunAgentOpts {
 export async function runAgent({
   ticket,
   cwd,
+  worktreePath,
   packsDir,
   repoMapRoot,
   componentDir = 'src/components/InteractionReviewPanel',
@@ -90,10 +97,12 @@ export async function runAgent({
   // eslint-disable-next-line no-console
   console.log(`[context] indexed ${repoMap.files.length} files via ts-morph`);
 
-  // ── Hooks (PreToolUse scope-guard + import-audit, PostToolUse fast-gate)
+  // ── Hooks (PreToolUse scope-guard + import-audit, PostToolUse fast-gate,
+  //          Stop stuck-loop detector)
   const hookCollectors = createHookCollectors();
   const hooks = buildHooks({
     agentCwd: cwd,
+    worktreePath,
     fileScope: ticket.fileScope,
     collectors: hookCollectors,
   });
