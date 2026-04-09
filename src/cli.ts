@@ -28,9 +28,9 @@ import 'dotenv/config';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { parseTicket } from './parseTicket';
 import { runAgent } from './runAgent';
+import { runReviewer } from './runReviewer';
 import {
   commitAll,
   createWorktree,
@@ -39,6 +39,8 @@ import {
   pushBranch,
 } from './git';
 import { GitHubClient } from './github';
+import { newRunId, RunLogger } from './observability/logger';
+import { buildPrBody, buildPrTitle } from './observability/runReport';
 import type { RunState } from './types';
 
 interface CliArgs {
@@ -122,7 +124,9 @@ async function main() {
   console.log(`[stage 1] parsing ticket from ${ticketPath}`);
   const ticket = parseTicket(ticketPath);
 
-  const runId = randomUUID().slice(0, 8);
+  const runId = newRunId();
+  const harnessRoot = process.cwd();
+  const logger = new RunLogger(resolve(harnessRoot, 'runs'), runId);
   const slug = ticket.title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -137,6 +141,21 @@ async function main() {
     branchName: branch,
   };
 
+  logger.log({
+    t: 'run.start',
+    ticketTitle: ticket.title,
+    ticketPath,
+    branch,
+    model: process.env.HARNESS_MODEL,
+  });
+  logger.transcript(`**Ticket**: ${ticket.title}`);
+  logger.transcript(`**Branch**: \`${branch}\``);
+  logger.transcript('');
+
+  // eslint-disable-next-line no-console
+  console.log(`[run] id=${runId}`);
+  // eslint-disable-next-line no-console
+  console.log(`[run] log dir: runs/${runId}/`);
   // eslint-disable-next-line no-console
   console.log(
     `[stage 1] parsed: title="${ticket.title}", subtasks=${ticket.subTasks.length}, ` +
@@ -200,10 +219,11 @@ async function main() {
   // the worktree — packs are part of the orchestrator, not the target).
   // The repo map is built from the worktree's seed/src so it reflects the
   // exact files the agent will be editing.
-  const harnessRoot = process.cwd();
   const packsDir = resolve(harnessRoot, 'context-packs', 'medplum');
   const repoMapRoot = resolve(agentCwd, 'src');
 
+  logger.log({ t: 'stage.enter', stage: 'execute' });
+  const stage4Start = Date.now();
   const result = await runAgent({
     ticket,
     cwd: agentCwd,
@@ -211,6 +231,53 @@ async function main() {
     repoMapRoot,
     ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
   });
+  logger.log({
+    t: 'stage.exit',
+    stage: 'execute',
+    durationMs: Date.now() - stage4Start,
+    ok: result.ok,
+  });
+  logger.log({
+    t: 'budget.tick',
+    costUsd: result.totalCostUsd,
+    turns: result.numTurns,
+    durationMs: result.durationMs,
+  });
+  if (result.finalGateResult) {
+    logger.log({
+      t: 'gate.result',
+      invocation: result.gateInvocations,
+      ok: result.finalGateResult.ok,
+      gates: result.finalGateResult.gates,
+    });
+  }
+  for (const d of result.hookEvents.scopeDenials) {
+    logger.log({
+      t: 'hook.deny',
+      hook: 'scope-guard',
+      reason: d.reason,
+      ...(d.targetPath ? { targetPath: d.targetPath } : {}),
+      ...(d.command ? { command: d.command } : {}),
+    });
+  }
+  for (const d of result.hookEvents.importDenials) {
+    logger.log({
+      t: 'hook.deny',
+      hook: 'import-audit',
+      reason: d.reason,
+      targetPath: d.filePath,
+      specifier: d.specifier,
+    });
+  }
+  for (const f of result.hookEvents.fastGateFailures) {
+    logger.log({
+      t: 'hook.fast-gate',
+      filePath: f.filePath,
+      gate: f.gate,
+      output: f.output.slice(0, 1000),
+    });
+  }
+
   // eslint-disable-next-line no-console
   console.log(
     `[stage 4] agent done: ok=${result.ok} turns=${result.numTurns} ` +
@@ -218,16 +285,57 @@ async function main() {
   );
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Stage 5: (stub) Quality gates — Phase 3 will run the 11-gate ladder.
+  // Stage 5: Quality gates — already collected during stage 4 via the
+  // run_gates MCP tool. Surfaced via result.finalGateResult.
   // ─────────────────────────────────────────────────────────────────────────
-  // eslint-disable-next-line no-console
-  console.log('[stage 5] gates: (stub — Phase 3 will run the 11-gate ladder)');
+  if (result.finalGateResult) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[stage 5] final gates: ${result.finalGateResult.ok ? 'PASS' : 'FAIL'} ` +
+        `(${result.finalGateResult.gates.filter((g) => g.ok).length}/${result.finalGateResult.gates.length})`,
+    );
+  } else {
+    // eslint-disable-next-line no-console
+    console.log('[stage 5] WARNING: agent did not invoke run_gates');
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Stage 6: (stub) Reviewer subagent — Phase 4.
+  // Stage 6: Reviewer subagent (read-only LLM-as-judge on the AC checklist)
   // ─────────────────────────────────────────────────────────────────────────
-  // eslint-disable-next-line no-console
-  console.log('[stage 6] reviewer: (stub — Phase 4 will spawn a read-only reviewer subagent)');
+  logger.log({ t: 'stage.enter', stage: 'review' });
+  const stage6Start = Date.now();
+  let reviewerVerdict: Awaited<ReturnType<typeof runReviewer>> | null = null;
+  try {
+    reviewerVerdict = await runReviewer({
+      ticket,
+      cwd: agentCwd,
+      ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[stage 6] reviewer threw:', (err as Error).message);
+    logger.log({
+      t: 'error',
+      where: 'stage 6 / runReviewer',
+      message: (err as Error).message,
+      ...((err as Error).stack ? { stack: (err as Error).stack as string } : {}),
+    });
+  }
+  logger.log({
+    t: 'stage.exit',
+    stage: 'review',
+    durationMs: Date.now() - stage6Start,
+    ok: reviewerVerdict?.verdict !== null,
+  });
+  if (reviewerVerdict?.verdict) {
+    logger.log({
+      t: 'reviewer.verdict',
+      approved: reviewerVerdict.verdict.approved,
+      criterionResults: reviewerVerdict.verdict.criterionResults,
+      comments: reviewerVerdict.verdict.comments,
+    });
+    logger.writeJson('reviewer-verdict.json', reviewerVerdict.verdict);
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Stage 7: Open PR (or print diff if --no-pr / no PAT)
@@ -236,12 +344,48 @@ async function main() {
   if (!state.producedChanges) {
     // eslint-disable-next-line no-console
     console.log('[stage 7] no changes in worktree — nothing to commit. Run complete.');
+    logger.log({ t: 'run.end', outcome: 'failed', reason: 'no changes produced by agent' });
     return;
   }
 
   // eslint-disable-next-line no-console
   console.log('[stage 7] worktree has changes — committing');
   commitAll(wt.path, `harness(${runId}): ${ticket.title}`);
+
+  // Determine escalation status. The PR is "approved" if the reviewer
+  // verdict is approved AND all run_gates passed AND the agent didn't hit
+  // any hard hook denials. Otherwise it's a draft escalation.
+  const approved =
+    reviewerVerdict?.verdict?.approved === true &&
+    (result.finalGateResult?.ok ?? false) &&
+    result.hookEvents.scopeDenials.length === 0 &&
+    result.hookEvents.importDenials.length === 0;
+  const escalationReason = !approved
+    ? !reviewerVerdict?.verdict
+      ? 'no reviewer verdict'
+      : !reviewerVerdict.verdict.approved
+      ? 'reviewer requested changes'
+      : !result.finalGateResult?.ok
+      ? 'run_gates ladder failed or was not invoked'
+      : result.hookEvents.scopeDenials.length > 0
+      ? `${result.hookEvents.scopeDenials.length} scope-guard denials`
+      : `${result.hookEvents.importDenials.length} hallucinated imports caught`
+    : undefined;
+
+  const reportInput = {
+    ticket,
+    runId,
+    branch,
+    agentResult: result,
+    reviewerVerdict: reviewerVerdict?.verdict ?? null,
+    reviewerCostUsd: reviewerVerdict?.costUsd ?? 0,
+    reviewerDurationMs: reviewerVerdict?.durationMs ?? 0,
+    escalated: !approved,
+    ...(escalationReason ? { escalationReason } : {}),
+  };
+  const prTitle = buildPrTitle(reportInput);
+  const prBody = buildPrBody(reportInput);
+  logger.writeJson('final-report.json', { prTitle, prBody, approved, escalationReason });
 
   if (args.noPr || !process.env.GH_PAT) {
     const reason = args.noPr ? '--no-pr flag' : 'GH_PAT not set';
@@ -250,8 +394,15 @@ async function main() {
     // eslint-disable-next-line no-console
     console.log(`[stage 7] worktree branch: ${branch} at ${wt.path}`);
     // eslint-disable-next-line no-console
-    console.log('[stage 7] diff vs base:');
-    process.stdout.write(diffVsBase(wt.path, args.base));
+    console.log('[stage 7] would-be PR:');
+    // eslint-disable-next-line no-console
+    console.log(`  title: ${prTitle}`);
+    // eslint-disable-next-line no-console
+    console.log(`  body length: ${prBody.length} chars`);
+    // eslint-disable-next-line no-console
+    console.log('[stage 7] diff vs base (truncated):');
+    process.stdout.write(diffVsBase(wt.path, args.base).slice(0, 4000));
+    logger.log({ t: 'run.end', outcome: 'failed', reason: `${reason}` });
     return;
   }
 
@@ -266,47 +417,25 @@ async function main() {
   pushBranch(wt.path, branch);
 
   const gh = new GitHubClient(process.env.GH_PAT);
-  const prBody = buildSimplePrBody(state, result);
   // eslint-disable-next-line no-console
-  console.log(`[stage 7] opening PR on ${owner}/${repo}`);
+  console.log(`[stage 7] opening ${approved ? '' : 'DRAFT '}PR on ${owner}/${repo}`);
   const url = await gh.openPr({
     coords: { owner, repo },
     branch,
     baseBranch: args.base,
-    title: `[harness] ${ticket.title}`,
+    title: prTitle,
     body: prBody,
+    draft: !approved,
   });
   state.prUrl = url;
+  logger.log({
+    t: 'run.end',
+    outcome: approved ? 'pr-opened' : 'escalated',
+    prUrl: url,
+    ...(escalationReason ? { reason: escalationReason } : {}),
+  });
   // eslint-disable-next-line no-console
-  console.log(`[stage 7] PR opened: ${url}`);
-}
-
-function buildSimplePrBody(state: RunState, result: { numTurns: number; totalCostUsd: number; durationMs: number; ok: boolean; finalText: string }): string {
-  // Phase 1 PR body. Phases 4-5 replace this with the structured run report
-  // including gate results, AC verdict, and the full transcript.
-  return `# Harness Run (Phase 1 skeleton)
-
-**Run ID**: \`${state.runId}\`
-**Status**: ${result.ok ? 'agent reported success' : 'agent reported error'}
-**Turns**: ${result.numTurns}
-**Cost**: $${result.totalCostUsd.toFixed(4)}
-**Wall**: ${(result.durationMs / 1000).toFixed(1)}s
-
-## Ticket
-**${state.ticket.title}**
-
-${state.ticket.summary}
-
-## Sub-tasks (from ticket)
-${state.ticket.subTasks.map((t) => `- \`${t.id}\` ${t.title}`).join('\n')}
-
-## Agent's final summary
-${result.finalText || '_(no summary returned)_'}
-
----
-*This PR was opened by intrahealth-harness Phase 1 skeleton. No quality gates, hooks, or
-reviewer subagent ran — those are added in Phases 2–5.*
-`;
+  console.log(`[stage 7] ${approved ? 'PR' : 'DRAFT escalation PR'} opened: ${url}`);
 }
 
 main().catch((err) => {
