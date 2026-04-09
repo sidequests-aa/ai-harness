@@ -2,10 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { resolve } from 'node:path';
 import { parseTicket } from '../src/parseTicket';
 
-const TICKET_PATH = resolve(
-  __dirname,
-  '../../medplum-interaction-panel/.harness/tickets/001-interaction-review-panel.md',
-);
+const TICKET_PATH = resolve(__dirname, '../tickets/001-interaction-review-panel.md');
 
 describe('parseTicket', () => {
   const ticket = parseTicket(TICKET_PATH);

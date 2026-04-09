@@ -16,8 +16,12 @@ export interface AgentRunResult {
 
 interface RunAgentOpts {
   ticket: Ticket;
-  /** Absolute path to the git worktree the agent should operate inside. */
-  worktreePath: string;
+  /**
+   * Absolute path the agent should run inside. Usually the seed subfolder of
+   * the harness's worktree (so the agent's `npm test` runs in the seed root)
+   * but can be the worktree root for repos without a seed subdir.
+   */
+  cwd: string;
   /** Optional model override (e.g. 'claude-haiku-4-5' for cheap dev runs). */
   model?: string;
 }
@@ -36,7 +40,7 @@ interface RunAgentOpts {
  *
  * Streams messages to stdout as they arrive. Returns a summary at the end.
  */
-export async function runAgent({ ticket, worktreePath, model }: RunAgentOpts): Promise<AgentRunResult> {
+export async function runAgent({ ticket, cwd, model }: RunAgentOpts): Promise<AgentRunResult> {
   const start = Date.now();
 
   const systemPrompt = buildSystemPrompt(ticket);
@@ -47,14 +51,14 @@ export async function runAgent({ ticket, worktreePath, model }: RunAgentOpts): P
   let ok = false;
 
   // eslint-disable-next-line no-console
-  console.log(`[agent] starting in ${worktreePath}`);
+  console.log(`[agent] starting in ${cwd}`);
   // eslint-disable-next-line no-console
   console.log(`[agent] model=${model ?? 'default'} maxTurns=${ticket.budgets.maxTurns}`);
 
   for await (const message of query({
     prompt: ticket.raw,
     options: {
-      cwd: worktreePath,
+      cwd,
       systemPrompt,
       allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash'],
       permissionMode: 'acceptEdits',
@@ -111,7 +115,7 @@ export async function runAgent({ ticket, worktreePath, model }: RunAgentOpts): P
 
 function buildSystemPrompt(ticket: Ticket): string {
   return `You are an AI engineer working on a TypeScript + React + Vite project (the seed
-target for an AI engineering harness).
+target inside an AI engineering harness's monorepo).
 
 Your job is to satisfy **every** acceptance criterion in the ticket below. The placeholder
 component currently throws on render — your task is to replace it with a real implementation.
@@ -124,7 +128,7 @@ component currently throws on render — your task is to replace it with a real 
   \`src/components/InteractionReviewPanel/InteractionReviewPanel.tsx\`. The
   \`src/components/InteractionReviewPanel/index.ts\` re-export already exists.
 - Tests use **vitest** + **@testing-library/react** + **@medplum/mock**. Run them with
-  \`npm test\` (from the project root) to verify your work.
+  \`npm test\` (from this directory, which is the seed root) to verify your work.
 - The Drug Interaction API is **injected**, not imported. Define the interface at
   \`src/types/drugInteractionApi.ts\` and accept it via props or React context.
 - Use \`@mantine/core\` UI primitives where they exist (Alert, Badge, Button, Stack) — they
@@ -142,7 +146,8 @@ component currently throws on render — your task is to replace it with a real 
 5. When complete, write a brief summary of what changed and why.
 
 You have access to: Read, Write, Edit, Glob, Grep, Bash. Use Bash for \`npm test\` and
-similar verification commands. The current working directory is the seed repo root.
+similar verification commands. The current working directory is the seed root inside the
+harness's worktree.
 
 The ticket follows.`;
 }

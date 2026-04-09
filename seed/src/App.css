@@ -1,0 +1,41 @@
+.demo {
+  max-width: 760px;
+  margin: 2rem auto;
+  padding: 1rem 1.5rem;
+  font-family: system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+}
+
+.demo header h1 {
+  margin-bottom: 0.25rem;
+  font-size: 1.5rem;
+}
+
+.demo header p {
+  margin-top: 0;
+  color: #555;
+}
+
+.demo-mount {
+  margin-top: 2rem;
+  padding: 1.5rem;
+  border: 1px dashed #c9c9c9;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.demo-error {
+  color: #8b1a1a;
+  background: #fff5f5;
+  padding: 1rem;
+  border-radius: 6px;
+  border: 1px solid #f0c0c0;
+}
+
+.demo-error pre {
+  background: #fff;
+  padding: 0.75rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+}

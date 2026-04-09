@@ -3,14 +3,20 @@
  * intrahealth-harness CLI — Phase 1 skeleton.
  *
  * Reads a ticket markdown file, runs the Claude Agent SDK in an isolated git
- * worktree of the target repo, and (if a GitHub PAT is configured) pushes the
- * branch and opens a PR. Phase 1 has no quality gates, no hooks, no reviewer
- * subagent — those land in Phases 2-5.
+ * worktree of the harness repo, and (if a GitHub PAT is configured) pushes
+ * the branch and opens a PR. Phase 1 has no quality gates, no hooks, no
+ * reviewer subagent — those land in Phases 2-5.
  *
- * Usage:
+ * The harness and the seed it builds against live in a single repo:
+ *   intrahealth-harness/        ← this repo, the deliverable
+ *   ├── src/                    ← harness source (the orchestrator)
+ *   ├── seed/                   ← target the agent operates inside
+ *   └── tickets/                ← work orders the harness consumes
+ *
+ * Usage (run from intrahealth-harness/):
  *   npm run harness -- run \\
- *     --target ../medplum-interaction-panel \\
- *     --ticket ../medplum-interaction-panel/.harness/tickets/001-interaction-review-panel.md
+ *     --target ./seed \\
+ *     --ticket ./tickets/001-interaction-review-panel.md
  *
  * Optional flags:
  *   --no-pr   Skip the push + PR-creation step (local-only run for iteration)
@@ -35,7 +41,11 @@ import type { RunState } from './types';
 
 interface CliArgs {
   command: 'run';
+  /** Path to the git repo root (the harness repo). Defaults to '.'. */
   target: string;
+  /** Subdir within the worktree the agent runs inside. Defaults to 'seed'. */
+  cwdSubdir: string;
+  /** Path to the ticket markdown file. */
   ticket: string;
   noPr: boolean;
   owner: string | undefined;
@@ -44,7 +54,8 @@ interface CliArgs {
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  let target: string | undefined;
+  let target = '.';
+  let cwdSubdir = 'seed';
   let ticket: string | undefined;
   let owner: string | undefined;
   let repo: string | undefined;
@@ -59,6 +70,9 @@ function parseArgs(argv: string[]): CliArgs {
     switch (a) {
       case '--target':
         target = requireNext(argv, ++i, '--target');
+        break;
+      case '--cwd-subdir':
+        cwdSubdir = requireNext(argv, ++i, '--cwd-subdir');
         break;
       case '--ticket':
         ticket = requireNext(argv, ++i, '--ticket');
@@ -79,9 +93,8 @@ function parseArgs(argv: string[]): CliArgs {
         fail(`Unknown flag: ${a}`);
     }
   }
-  if (!target) fail('Missing required --target <path-to-seed-repo>');
   if (!ticket) fail('Missing required --ticket <path-to-ticket-md>');
-  return { command: 'run', target, ticket, noPr, owner, repo, base };
+  return { command: 'run', target, cwdSubdir, ticket, noPr, owner, repo, base };
 }
 
 function requireNext(argv: string[], i: number, flag: string): string {
@@ -146,11 +159,18 @@ async function main() {
   // ─────────────────────────────────────────────────────────────────────────
   const targetRepo = resolve(args.target);
   // eslint-disable-next-line no-console
-  console.log(`[stage 4] creating worktree in ${targetRepo} on branch ${branch}`);
+  console.log(`[stage 4] creating worktree of ${targetRepo} on branch ${branch}`);
   const wt = createWorktree({ targetRepo, branch, baseBranch: args.base });
   state.worktreePath = wt.path;
+
+  // The agent's cwd is the seed subdir within the worktree (defaults to "seed").
+  // This is what makes a single-repo monorepo work: git worktrees operate at
+  // the repo level but the agent only sees / operates inside seed/.
+  const agentCwd = args.cwdSubdir ? resolve(wt.path, args.cwdSubdir) : wt.path;
   // eslint-disable-next-line no-console
   console.log(`[stage 4] worktree: ${wt.path}`);
+  // eslint-disable-next-line no-console
+  console.log(`[stage 4] agent cwd: ${agentCwd}`);
 
   if (!process.env.ANTHROPIC_API_KEY) {
     fail('ANTHROPIC_API_KEY is not set in the environment (.env). Aborting before agent run.');
@@ -158,7 +178,7 @@ async function main() {
 
   const result = await runAgent({
     ticket,
-    worktreePath: wt.path,
+    cwd: agentCwd,
     ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
   });
   // eslint-disable-next-line no-console

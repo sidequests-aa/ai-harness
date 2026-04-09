@@ -24,7 +24,7 @@ _(filled in Phase 3)_
 
 _(filled in Phase 5)_
 
-## 5. The seed-not-fork decision
+## 5. The seed-not-fork decision (and the seed-as-subfolder follow-up)
 
 We did not fork `medplum/medplum`. Reasons:
 
@@ -32,7 +32,9 @@ We did not fork `medplum/medplum`. Reasons:
 - We lose control of the context surface: with the full monorepo, we cannot curate what the agent sees, which makes our context-assembly story indefensible.
 - A fork hides the real skill being graded — *deliberately shaping the context*. The brief explicitly frames the component as the *work order*, not the deliverable.
 
-A custom `medplum-interaction-panel` seed (Vite + React + TS, importing only `@medplum/core` and `@medplum/react`) is the honest expression of the "harness is the point" framing.
+A custom seed (Vite + React + TS, importing only `@medplum/core` and `@medplum/react`) is the honest expression of the "harness is the point" framing.
+
+**Why the seed lives as a subfolder of this repo, not a sibling repo**: the brief asks for "a GitHub repo" (singular) as the deliverable. A single repo with `harness/source/...` at the root and `seed/` as a subfolder gives graders one URL to click. The harness creates a worktree of this repo and the agent's `cwd` is set to the seed subfolder inside the worktree — so PRs open against this same repo with changes confined to `seed/`. Git worktrees operate at the repo level, but nothing requires the agent's CWD to be the worktree root.
 
 ## 6. The no-RAG decision
 
