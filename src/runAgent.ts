@@ -1,7 +1,8 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { resolve } from 'node:path';
 import { loadPacks, renderPacks, type LoadPacksResult } from './contextPacks';
 import { buildRepoMap, renderRepoMap } from './repoMap';
+import { buildHooks, createHookCollectors, type HookCollectors } from './hooks';
+import { createRunGatesServer, type GateLadderResult } from './tools/runGates';
 import type { Ticket } from './types';
 
 export interface AgentRunResult {
@@ -15,6 +16,12 @@ export interface AgentRunResult {
   finalText: string;
   /** True if the SDK reported a successful (non-error) result subtype. */
   ok: boolean;
+  /** Hook collectors with everything that fired during the run. */
+  hookEvents: HookCollectors;
+  /** Last gate-ladder result, if the agent ran run_gates at least once. */
+  finalGateResult?: GateLadderResult;
+  /** Number of times the agent invoked run_gates (proxy for self-correction). */
+  gateInvocations: number;
 }
 
 interface RunAgentOpts {
@@ -35,6 +42,12 @@ interface RunAgentOpts {
    * `src/` directory inside the agent's worktree).
    */
   repoMapRoot: string;
+  /**
+   * Component subdir relative to `cwd`, used by the run_gates tool to scope
+   * the API-contract check (G9) and visual-state coverage (G10). Defaults to
+   * `src/components/InteractionReviewPanel`.
+   */
+  componentDir?: string;
   /** Optional model override (e.g. 'claude-haiku-4-5' for cheap dev runs). */
   model?: string;
 }
@@ -58,6 +71,7 @@ export async function runAgent({
   cwd,
   packsDir,
   repoMapRoot,
+  componentDir = 'src/components/InteractionReviewPanel',
   model,
 }: RunAgentOpts): Promise<AgentRunResult> {
   const start = Date.now();
@@ -76,6 +90,39 @@ export async function runAgent({
   // eslint-disable-next-line no-console
   console.log(`[context] indexed ${repoMap.files.length} files via ts-morph`);
 
+  // ── Hooks (PreToolUse scope-guard + import-audit, PostToolUse fast-gate)
+  const hookCollectors = createHookCollectors();
+  const hooks = buildHooks({
+    agentCwd: cwd,
+    fileScope: ticket.fileScope,
+    collectors: hookCollectors,
+  });
+
+  // ── Custom MCP tool: run_gates (G6-G10) ──────────────────────────────────
+  const expectedStateTestids = [
+    'state-loading',
+    'state-no-interactions',
+    'state-minor',
+    'state-critical',
+    'state-api-error',
+  ];
+  let finalGateResult: GateLadderResult | undefined;
+  let gateInvocations = 0;
+  const gatesServer = createRunGatesServer({
+    agentCwd: cwd,
+    expectedStateTestids,
+    componentDir,
+    onResult: (r) => {
+      gateInvocations++;
+      finalGateResult = r;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[gates] invocation #${gateInvocations} → ${r.ok ? 'ALL PASS' : 'FAILURES'} ` +
+          `(${r.gates.filter((g) => g.ok).length}/${r.gates.length})`,
+      );
+    },
+  });
+
   const systemPrompt = buildSystemPrompt(ticket, packsResult, renderRepoMap(repoMap));
 
   let numTurns = 0;
@@ -87,15 +134,29 @@ export async function runAgent({
   console.log(`[agent] starting in ${cwd}`);
   // eslint-disable-next-line no-console
   console.log(`[agent] model=${model ?? 'default'} maxTurns=${ticket.budgets.maxTurns}`);
+  // eslint-disable-next-line no-console
+  console.log(`[agent] hooks: PreToolUse(scope-guard, import-audit) + PostToolUse(fast-gate)`);
+  // eslint-disable-next-line no-console
+  console.log(`[agent] custom tools: mcp__harness__run_gates`);
 
   for await (const message of query({
     prompt: ticket.raw,
     options: {
       cwd,
       systemPrompt,
-      allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash'],
+      allowedTools: [
+        'Read',
+        'Write',
+        'Edit',
+        'Glob',
+        'Grep',
+        'Bash',
+        'mcp__harness__run_gates',
+      ],
       permissionMode: 'acceptEdits',
       maxTurns: ticket.budgets.maxTurns,
+      hooks,
+      mcpServers: { harness: gatesServer },
       ...(model ? { model } : {}),
     },
   })) {
@@ -137,12 +198,23 @@ export async function runAgent({
     }
   }
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[agent] denials: scope=${hookCollectors.scopeDenials.length} ` +
+      `import=${hookCollectors.importDenials.length} ` +
+      `fastGate=${hookCollectors.fastGateFailures.length} ` +
+      `gateInvocations=${gateInvocations}`,
+  );
+
   return {
     numTurns,
     totalCostUsd,
     durationMs: Date.now() - start,
     finalText,
     ok,
+    hookEvents: hookCollectors,
+    ...(finalGateResult ? { finalGateResult } : {}),
+    gateInvocations,
   };
 }
 
@@ -182,11 +254,28 @@ component currently throws on render — your task is to replace it with a real 
 2. Define the DrugInteractionApi interface first (sub-task ST1).
 3. Implement the component, then the tests.
 4. Run \`npm test\` and iterate until **every** test passes.
-5. When complete, write a brief summary of what changed and why.
+5. **You MUST call \`mcp__harness__run_gates\` before declaring your work complete.**
+   This runs the harness quality-gate ladder (G6 vitest, G7 RTL smoke, G8 FHIR shape,
+   G9 API gate contract, G10 visual-state coverage). If any gate fails, fix it and
+   call \`run_gates\` again. Do not stop while any gate is failing.
+6. When all gates pass, write a brief summary of what changed and why.
 
-You have access to: Read, Write, Edit, Glob, Grep, Bash. Use Bash for \`npm test\` and
-similar verification commands. The current working directory is the seed root inside the
-harness's worktree.
+## Active hooks (the harness will block disallowed actions)
+
+- **Scope-guard (PreToolUse)** — denies any Write/Edit outside the ticket's File Scope
+  and any Bash command that mutates out-of-scope paths or calls
+  \`npm install\`/\`git checkout\`/\`rm\`. If you need a file outside scope you must
+  work around it; the harness will surface scope-expansion requests to the human reviewer.
+- **Import-audit (PreToolUse)** — parses your .ts/.tsx writes with ts-morph and denies
+  any import that references a package not in the seed's package.json or a relative
+  path that does not resolve. Hallucinated imports are caught before the file is
+  written.
+- **Fast-gate (PostToolUse)** — runs prettier and eslint on every Write/Edit and feeds
+  failures back to you in the next turn. Fix them inline, do not ignore.
+
+You have access to: Read, Write, Edit, Glob, Grep, Bash, and the custom tool
+\`mcp__harness__run_gates\`. Use Bash for \`npm test\` and other verification. The current
+working directory is the seed root inside the harness's worktree.
 
 ## Curated context (Layer A — packs)
 
