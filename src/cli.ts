@@ -164,16 +164,20 @@ async function main() {
   );
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Stage 2: (stub) Plan = identity transform of ticket sub-tasks
+  // Stage 2: Plan — identity transform of the ticket's sub-tasks (the
+  // human-authored DAG is the plan; a future planner subagent could refine
+  // it into file-level work items).
   // ─────────────────────────────────────────────────────────────────────────
   // eslint-disable-next-line no-console
-  console.log(`[stage 2] plan: ${state.plan!.subTasks.map((t) => t.id).join(' → ')} (stub)`);
+  console.log(`[stage 2] plan: ${state.plan!.subTasks.map((t) => t.id).join(' → ')}`);
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Stage 3: (stub) Context assembly — Phase 2 will inject curated packs.
+  // Stage 3: Context assembly — runs inside runAgent so the worktree exists.
+  // The actual loadPacks + buildRepoMap calls happen there; this log line
+  // marks the boundary.
   // ─────────────────────────────────────────────────────────────────────────
   // eslint-disable-next-line no-console
-  console.log('[stage 3] context: (stub — Phase 2 will inject curated packs + repo map)');
+  console.log('[stage 3] context: (assembled inside runAgent — see [context] lines below)');
 
   // ─────────────────────────────────────────────────────────────────────────
   // Stage 4: Execute — create worktree and run the agent inside it

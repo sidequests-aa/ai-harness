@@ -148,27 +148,31 @@ export async function runAgent({
   // eslint-disable-next-line no-console
   console.log(`[agent] custom tools: mcp__harness__run_gates`);
 
-  for await (const message of query({
-    prompt: ticket.raw,
-    options: {
-      cwd,
-      systemPrompt,
-      allowedTools: [
-        'Read',
-        'Write',
-        'Edit',
-        'Glob',
-        'Grep',
-        'Bash',
-        'mcp__harness__run_gates',
-      ],
-      permissionMode: 'acceptEdits',
-      maxTurns: ticket.budgets.maxTurns,
-      hooks,
-      mcpServers: { harness: gatesServer },
-      ...(model ? { model } : {}),
-    },
-  })) {
+  // Wrap the iterator in try/catch so SDK errors (e.g. "Reached maximum
+  // number of turns") don't crash the harness — they're a documented
+  // failure mode and the cli should still produce an escalation PR.
+  try {
+    for await (const message of query({
+      prompt: ticket.raw,
+      options: {
+        cwd,
+        systemPrompt,
+        allowedTools: [
+          'Read',
+          'Write',
+          'Edit',
+          'Glob',
+          'Grep',
+          'Bash',
+          'mcp__harness__run_gates',
+        ],
+        permissionMode: 'acceptEdits',
+        maxTurns: ticket.budgets.maxTurns,
+        hooks,
+        mcpServers: { harness: gatesServer },
+        ...(model ? { model } : {}),
+      },
+    })) {
     // Discriminate on message.type — every shape we care about lives there.
     // We deliberately don't import the SDK's Message types in Phase 1 because
     // their shape is still moving; we narrow at use-sites instead.
@@ -205,6 +209,17 @@ export async function runAgent({
         `[agent] result subtype=${r.subtype} turns=${r.num_turns} cost=$${totalCostUsd.toFixed(4)}`,
       );
     }
+  }
+  } catch (err) {
+    // SDK errors (e.g. maxTurns reached) are a documented failure mode.
+    // We mark the run as not-ok and let the cli's escalation logic surface
+    // it in the PR description rather than crashing the whole harness.
+    const message = (err as Error).message ?? String(err);
+    // eslint-disable-next-line no-console
+    console.log(`[agent] SDK error: ${message}`);
+    if (!finalText) finalText = `_SDK error: ${message}_`;
+    ok = false;
+    if (numTurns === 0) numTurns = ticket.budgets.maxTurns; // assume the cap was hit
   }
 
   // eslint-disable-next-line no-console

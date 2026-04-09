@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
@@ -307,7 +307,7 @@ function findFiles(
   function walk(dir: string) {
     let entries: string[];
     try {
-      entries = require('node:fs').readdirSync(dir);
+      entries = readdirSync(dir);
     } catch {
       return;
     }
@@ -316,7 +316,7 @@ function findFiles(
       const full = join(dir, e);
       let stat;
       try {
-        stat = require('node:fs').statSync(full);
+        stat = statSync(full);
       } catch {
         continue;
       }
