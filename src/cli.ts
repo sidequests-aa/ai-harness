@@ -25,6 +25,8 @@
  *   --base    Base branch for the worktree + PR (default: main)
  */
 import 'dotenv/config';
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parseTicket } from './parseTicket';
@@ -171,6 +173,24 @@ async function main() {
   console.log(`[stage 4] worktree: ${wt.path}`);
   // eslint-disable-next-line no-console
   console.log(`[stage 4] agent cwd: ${agentCwd}`);
+
+  // Warm up the worktree: node_modules isn't tracked, so the fresh worktree
+  // has no installed deps. Run a fast offline install so the agent can run
+  // `npm test` immediately instead of thrashing on missing modules. Cache
+  // is already populated from the source seed install, so this is quick.
+  if (existsSync(resolve(agentCwd, 'package.json'))) {
+    // eslint-disable-next-line no-console
+    console.log('[stage 4] warming worktree: npm install --prefer-offline --no-audit --no-fund');
+    try {
+      execFileSync('npm', ['install', '--prefer-offline', '--no-audit', '--no-fund'], {
+        cwd: agentCwd,
+        stdio: 'inherit',
+        shell: process.platform === 'win32',
+      });
+    } catch (err) {
+      fail(`npm install in worktree failed: ${(err as Error).message}`);
+    }
+  }
 
   if (!process.env.ANTHROPIC_API_KEY) {
     fail('ANTHROPIC_API_KEY is not set in the environment (.env). Aborting before agent run.');
