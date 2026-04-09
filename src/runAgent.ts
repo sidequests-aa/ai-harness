@@ -1,4 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { resolve } from 'node:path';
+import { loadPacks, renderPacks, type LoadPacksResult } from './contextPacks';
+import { buildRepoMap, renderRepoMap } from './repoMap';
 import type { Ticket } from './types';
 
 export interface AgentRunResult {
@@ -22,6 +25,16 @@ interface RunAgentOpts {
    * but can be the worktree root for repos without a seed subdir.
    */
   cwd: string;
+  /**
+   * Absolute path to the directory containing curated context packs.
+   * Defaults to `<harness-root>/context-packs/medplum`.
+   */
+  packsDir: string;
+  /**
+   * Absolute path to the directory the repo map indexes (usually the seed's
+   * `src/` directory inside the agent's worktree).
+   */
+  repoMapRoot: string;
   /** Optional model override (e.g. 'claude-haiku-4-5' for cheap dev runs). */
   model?: string;
 }
@@ -40,10 +53,30 @@ interface RunAgentOpts {
  *
  * Streams messages to stdout as they arrive. Returns a summary at the end.
  */
-export async function runAgent({ ticket, cwd, model }: RunAgentOpts): Promise<AgentRunResult> {
+export async function runAgent({
+  ticket,
+  cwd,
+  packsDir,
+  repoMapRoot,
+  model,
+}: RunAgentOpts): Promise<AgentRunResult> {
   const start = Date.now();
 
-  const systemPrompt = buildSystemPrompt(ticket);
+  // ── Layer A: curated context packs (eager) ───────────────────────────────
+  const packsResult = loadPacks(packsDir, ticket.contextPacks);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[context] loaded ${packsResult.packs.length}/${ticket.contextPacks.length} packs ` +
+      `(${packsResult.totalChars} chars)` +
+      (packsResult.missing.length > 0 ? `, missing: ${packsResult.missing.join(', ')}` : ''),
+  );
+
+  // ── Layer B: repo map (eager, compact) ───────────────────────────────────
+  const repoMap = buildRepoMap(repoMapRoot);
+  // eslint-disable-next-line no-console
+  console.log(`[context] indexed ${repoMap.files.length} files via ts-morph`);
+
+  const systemPrompt = buildSystemPrompt(ticket, packsResult, renderRepoMap(repoMap));
 
   let numTurns = 0;
   let totalCostUsd = 0;
@@ -113,7 +146,11 @@ export async function runAgent({ ticket, cwd, model }: RunAgentOpts): Promise<Ag
   };
 }
 
-function buildSystemPrompt(ticket: Ticket): string {
+function buildSystemPrompt(
+  ticket: Ticket,
+  packs: LoadPacksResult,
+  repoMapRendered: string,
+): string {
   return `You are an AI engineer working on a TypeScript + React + Vite project (the seed
 target inside an AI engineering harness's monorepo).
 
@@ -123,7 +160,9 @@ component currently throws on render — your task is to replace it with a real 
 ## Constraints
 
 - Only modify files inside the **File Scope** listed in the ticket. Do not touch anything
-  outside that scope (no edits to App.tsx, main.tsx, vite.config.ts, package.json, etc.).
+  outside that scope (no edits to App.tsx, main.tsx, vite.config.ts, package.json,
+  vitest.setup.ts, etc.). The vitest setup file already includes the matchMedia polyfill
+  Mantine needs — you don't need to add it.
 - The component must be exported as both a named export and a default export from
   \`src/components/InteractionReviewPanel/InteractionReviewPanel.tsx\`. The
   \`src/components/InteractionReviewPanel/index.ts\` re-export already exists.
@@ -149,7 +188,25 @@ You have access to: Read, Write, Edit, Glob, Grep, Bash. Use Bash for \`npm test
 similar verification commands. The current working directory is the seed root inside the
 harness's worktree.
 
-The ticket follows.`;
+## Curated context (Layer A — packs)
+
+The ticket opted into ${packs.packs.length} context pack(s). These are the patterns and
+gotchas the harness considers load-bearing for this kind of work. Treat them as
+authoritative for *this* codebase — don't apply generic React or Medplum advice that
+contradicts them.
+
+${renderPacks(packs.packs)}
+
+## Repo map (Layer B — compact structural index)
+
+Every \`.ts/.tsx\` file under \`src/\` and the symbols it exports. Use this to navigate
+without burning turns on \`Glob\`/\`Grep\`. If a symbol isn't here, it doesn't exist.
+
+${repoMapRendered}
+
+## The ticket
+
+The ticket markdown follows in the user message.`;
 }
 
 function truncate(s: string, n: number): string {

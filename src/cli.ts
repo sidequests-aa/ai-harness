@@ -196,9 +196,19 @@ async function main() {
     fail('ANTHROPIC_API_KEY is not set in the environment (.env). Aborting before agent run.');
   }
 
+  // Resolve context paths. Packs are read from the harness checkout (NOT
+  // the worktree — packs are part of the orchestrator, not the target).
+  // The repo map is built from the worktree's seed/src so it reflects the
+  // exact files the agent will be editing.
+  const harnessRoot = process.cwd();
+  const packsDir = resolve(harnessRoot, 'context-packs', 'medplum');
+  const repoMapRoot = resolve(agentCwd, 'src');
+
   const result = await runAgent({
     ticket,
     cwd: agentCwd,
+    packsDir,
+    repoMapRoot,
     ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
   });
   // eslint-disable-next-line no-console
