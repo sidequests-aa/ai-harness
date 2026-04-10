@@ -314,6 +314,7 @@ async function main() {
     reviewerVerdict = await runReviewer({
       ticket,
       cwd: agentCwd,
+      implementerSummary: result.finalText,
       ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
     });
   } catch (err) {

@@ -2,6 +2,11 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Ticket } from './types';
 
+// `z` is referenced via the schema definition below; the import is needed
+// for the value-position usage. Suppress an unused-import warning here so
+// we can keep the explicit import.
+void z;
+
 /**
  * The reviewer subagent (Phase 4 — Quality Gate G11).
  *
@@ -51,6 +56,11 @@ interface RunReviewerOpts {
   ticket: Ticket;
   /** Absolute path the reviewer should run inside (the seed root in the worktree). */
   cwd: string;
+  /**
+   * Implementer's final summary text. Passed into the reviewer's prompt so
+   * the reviewer doesn't have to re-derive context cold.
+   */
+  implementerSummary?: string;
   /** Optional model override. */
   model?: string;
 }
@@ -64,12 +74,15 @@ export interface ReviewerRunResult {
   rawText: string;
 }
 
-export async function runReviewer({ ticket, cwd, model }: RunReviewerOpts): Promise<ReviewerRunResult> {
+export async function runReviewer({
+  ticket,
+  cwd,
+  implementerSummary,
+  model,
+}: RunReviewerOpts): Promise<ReviewerRunResult> {
   const start = Date.now();
 
   const systemPrompt = buildReviewerPrompt(ticket);
-
-  const schema = z.toJSONSchema(ReviewVerdictSchema);
 
   let verdict: ReviewVerdict | null = null;
   let costUsd = 0;
@@ -79,27 +92,48 @@ export async function runReviewer({ ticket, cwd, model }: RunReviewerOpts): Prom
   // eslint-disable-next-line no-console
   console.log(`[reviewer] starting in ${cwd}`);
 
+  const userPrompt = `Review the implementer's work against the acceptance criteria below.
+
+## Acceptance criteria
+${ticket.acceptanceCriteria.map((ac) => `- **${ac.id}**: ${ac.text}`).join('\n')}
+
+${implementerSummary ? `## What the implementer claims it did\n\n${implementerSummary.slice(0, 2000)}\n\n` : ''}## How to investigate
+
+1. Run \`git diff main --stat\` (from this directory) to see what files changed.
+2. Run \`git diff main\` to see the full diff.
+3. \`Read\` the changed files to verify each criterion.
+4. **Be efficient.** You have a turn budget. Don't re-read the same file twice; don't grep for things you can see in the diff.
+
+## Output
+
+When you're ready (and **only** when you're ready — do not output JSON during exploration), respond with EXACTLY one fenced code block tagged \`json\` containing your verdict, and nothing else outside the fence:
+
+\`\`\`json
+{
+  "approved": boolean,
+  "criterionResults": [
+    { "id": "AC1", "status": "met" | "partial" | "unmet", "evidence": "file:line — short explanation" }
+  ],
+  "comments": "one-paragraph overall summary"
+}
+\`\`\`
+
+The harness parses your final message for that fenced JSON. If \`approved\` is false because of any partial/unmet criterion, the PR opens as a draft escalation.`;
+
   // Wrap the iterator in try/catch so SDK errors (e.g. maxTurns reached)
   // don't crash the harness — the cli will surface a "no verdict" reason
   // in the escalation PR rather than blowing up.
   try {
     for await (const message of query({
-      prompt: `Review the implementer's work against the acceptance criteria below and return your verdict as structured JSON.
-
-Acceptance criteria:
-${ticket.acceptanceCriteria.map((ac) => `- **${ac.id}**: ${ac.text}`).join('\n')}
-
-Use \`git diff main\` (from this directory) to see what changed, then \`Read\`/\`Grep\` the changed files to verify each criterion. Cite file:line in the evidence field.`,
+      prompt: userPrompt,
       options: {
         cwd,
         systemPrompt,
         allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
         permissionMode: 'default',
         // 12 ACs to verify, each potentially 1-2 file reads, plus the
-        // structured-output formulation step at the end. 40 turns leaves
-        // headroom; the budget is enforced post-hoc by the cli.
-        maxTurns: 40,
-        outputFormat: { type: 'json_schema', schema },
+        // formulation of the JSON verdict at the end.
+        maxTurns: 30,
         ...(model ? { model } : {}),
       },
     })) {
@@ -110,22 +144,27 @@ Use \`git diff main\` (from this directory) to see what changed, then \`Read\`/\
           result?: string;
           total_cost_usd?: number;
           num_turns?: number;
-          structured_output?: unknown;
         };
         costUsd = r.total_cost_usd ?? 0;
         turns = r.num_turns ?? 0;
         rawText = r.result ?? '';
-        if (r.structured_output) {
-          const parsed = ReviewVerdictSchema.safeParse(r.structured_output);
-          if (parsed.success) {
-            verdict = parsed.data;
+        // Parse a fenced ```json block from the result text. Robust to the
+        // model wrapping it in extra prose despite our instructions.
+        const parsed = parseFencedJson(rawText);
+        if (parsed) {
+          const validated = ReviewVerdictSchema.safeParse(parsed);
+          if (validated.success) {
+            verdict = validated.data;
           } else {
             // eslint-disable-next-line no-console
             console.warn(
-              '[reviewer] structured_output failed schema validation:',
-              parsed.error.message,
+              '[reviewer] fenced JSON failed schema validation:',
+              validated.error.message,
             );
           }
+        } else {
+          // eslint-disable-next-line no-console
+          console.warn('[reviewer] no fenced ```json block found in result text');
         }
       }
     }
@@ -149,6 +188,35 @@ Use \`git diff main\` (from this directory) to see what changed, then \`Read\`/\
     durationMs: Date.now() - start,
     rawText,
   };
+}
+
+/**
+ * Extract the first fenced ```json block from a chunk of text and parse it.
+ * Returns the parsed object, or null if no valid block was found.
+ *
+ * The model is instructed to wrap its verdict in exactly one such block.
+ * In practice it may also include prose or extra blocks; we take the first
+ * fenced block tagged `json` (or unlabelled if none) and try to parse it.
+ */
+function parseFencedJson(text: string): unknown | null {
+  if (!text) return null;
+  // Try `json`-tagged fences first.
+  const labelled = text.match(/```json\s*\n([\s\S]*?)```/i);
+  const candidates: string[] = [];
+  if (labelled?.[1]) candidates.push(labelled[1]);
+  // Fallback: any fenced block.
+  const unlabelled = text.match(/```\s*\n([\s\S]*?)```/);
+  if (unlabelled?.[1]) candidates.push(unlabelled[1]);
+  // Last resort: try the whole text.
+  candidates.push(text);
+  for (const c of candidates) {
+    try {
+      return JSON.parse(c);
+    } catch {
+      // try next
+    }
+  }
+  return null;
 }
 
 function buildReviewerPrompt(ticket: Ticket): string {
