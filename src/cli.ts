@@ -26,7 +26,7 @@
  */
 import 'dotenv/config';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseTicket } from './parseTicket';
 import { runAgent } from './runAgent';
@@ -43,7 +43,7 @@ import { newRunId, RunLogger } from './observability/logger';
 import { buildPrBody, buildPrTitle } from './observability/runReport';
 import type { RunState } from './types';
 
-interface CliArgs {
+interface RunArgs {
   command: 'run';
   /** Path to the git repo root (the harness repo). Defaults to '.'. */
   target: string;
@@ -57,7 +57,23 @@ interface CliArgs {
   base: string;
 }
 
+interface SyncTicketArgs {
+  command: 'sync-ticket';
+  ticket: string;
+  owner: string | undefined;
+  repo: string | undefined;
+}
+
+type CliArgs = RunArgs | SyncTicketArgs;
+
 function parseArgs(argv: string[]): CliArgs {
+  const cmd = argv[0];
+  if (cmd === 'run') return parseRunArgs(argv);
+  if (cmd === 'sync-ticket') return parseSyncTicketArgs(argv);
+  fail(`Unknown command: ${cmd ?? '(none)'}. Expected: run | sync-ticket`);
+}
+
+function parseRunArgs(argv: string[]): RunArgs {
   let target = '.';
   let cwdSubdir = 'seed';
   let ticket: string | undefined;
@@ -66,9 +82,6 @@ function parseArgs(argv: string[]): CliArgs {
   let noPr = false;
   let base = 'main';
 
-  if (argv[0] !== 'run') {
-    fail(`Unknown command: ${argv[0] ?? '(none)'}. Expected: run`);
-  }
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -101,6 +114,31 @@ function parseArgs(argv: string[]): CliArgs {
   return { command: 'run', target, cwdSubdir, ticket, noPr, owner, repo, base };
 }
 
+function parseSyncTicketArgs(argv: string[]): SyncTicketArgs {
+  let ticket: string | undefined;
+  let owner: string | undefined;
+  let repo: string | undefined;
+
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case '--ticket':
+        ticket = requireNext(argv, ++i, '--ticket');
+        break;
+      case '--owner':
+        owner = requireNext(argv, ++i, '--owner');
+        break;
+      case '--repo':
+        repo = requireNext(argv, ++i, '--repo');
+        break;
+      default:
+        fail(`Unknown flag: ${a}`);
+    }
+  }
+  if (!ticket) fail('Missing required --ticket <path-to-ticket-md>');
+  return { command: 'sync-ticket', ticket, owner, repo };
+}
+
 function requireNext(argv: string[], i: number, flag: string): string {
   const v = argv[i];
   if (v === undefined) fail(`Flag ${flag} requires a value`);
@@ -115,6 +153,11 @@ function fail(msg: string): never {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.command === 'sync-ticket') {
+    await runSyncTicket(args);
+    return;
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Stage 1: Parse ticket
@@ -463,6 +506,35 @@ async function main() {
   });
   // eslint-disable-next-line no-console
   console.log(`[stage 7] ${approved ? 'PR' : 'DRAFT escalation PR'} opened: ${url}`);
+}
+
+async function runSyncTicket(args: SyncTicketArgs): Promise<void> {
+  const ticketPath = resolve(args.ticket);
+  if (!existsSync(ticketPath)) fail(`Ticket file not found: ${ticketPath}`);
+
+  const ticket = parseTicket(ticketPath);
+  const raw = readFileSync(ticketPath, 'utf8');
+  // Strip the first H1 — it becomes the issue title. Leave every other heading
+  // in the body so sections like "## Sub-Tasks (DAG)" render intact on GitHub.
+  const lines = raw.split('\n');
+  const h1Idx = lines.findIndex((l) => /^#\s+/.test(l));
+  const body = (h1Idx >= 0 ? lines.slice(h1Idx + 1) : lines).join('\n').trim();
+
+  const owner = args.owner ?? process.env.HARNESS_TARGET_OWNER;
+  const repo = args.repo ?? process.env.HARNESS_TARGET_REPO;
+  if (!owner || !repo) {
+    fail('sync-ticket requires --owner and --repo (or HARNESS_TARGET_OWNER / HARNESS_TARGET_REPO env).');
+  }
+  if (!process.env.GH_PAT) {
+    fail('sync-ticket requires GH_PAT in the environment.');
+  }
+
+  const gh = new GitHubClient(process.env.GH_PAT);
+  // eslint-disable-next-line no-console
+  console.log(`[sync-ticket] → ${owner}/${repo} · "${ticket.title}"`);
+  const result = await gh.syncTicket({ owner, repo }, ticket.title, body);
+  // eslint-disable-next-line no-console
+  console.log(`[sync-ticket] ${result.action} #${result.number} → ${result.url}`);
 }
 
 main().catch((err) => {
