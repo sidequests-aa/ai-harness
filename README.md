@@ -69,6 +69,10 @@ npm run harness -- run --ticket ./tickets/001-interaction-review-panel.md
 npm run harness -- run --ticket ./tickets/001-interaction-review-panel.md --no-pr
 ```
 
+## Debugging against a local Medplum checkout
+
+The slash command `/medplum-hot-reload` runs the seed's Vite dev server against a locally-cloned Medplum monorepo (sibling folder `../medplum/`) so source edits in Medplum rebuild + hot-reload into the seed. This opts into the 5–15 min install cost that [DESIGN §0](./DESIGN.md#0-tldr) deliberately avoided — use it for debugging / exploring Medplum internals, not for the canonical demo. See [`.claude/commands/medplum-hot-reload.md`](./.claude/commands/medplum-hot-reload.md) for the step-by-step.
+
 ## Tech
 
 - **Harness**: TypeScript, `@anthropic-ai/claude-agent-sdk`, `@octokit/rest`, `zod`, `ts-morph`, `vitest`. ESM, Node ≥20.
