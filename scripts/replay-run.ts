@@ -50,8 +50,29 @@ function main() {
   }
 
   // Pretty mode — render as a readable transcript.
-  console.log(`# Replay: ${runDir}`);
-  console.log(`Events: ${events.length}`);
+  const startEvt = events.find((e) => e.t === 'run.start');
+  const endEvt = events.find((e) => e.t === 'run.end');
+  const budgetEvt = [...events].reverse().find((e) => e.t === 'budget.tick');
+  const verdictEvt = events.find((e) => e.t === 'reviewer.verdict');
+  const runId = startEvt && 'runId' in startEvt ? startEvt.runId : runDir.split(/[\\/]/).pop();
+  const cost = budgetEvt && 'costUsd' in budgetEvt ? `$${budgetEvt.costUsd.toFixed(2)}` : '—';
+  const turns = budgetEvt && 'turns' in budgetEvt ? `${budgetEvt.turns} turns` : '—';
+  const duration =
+    budgetEvt && 'durationMs' in budgetEvt ? `${(budgetEvt.durationMs / 1000).toFixed(0)}s` : '—';
+  const verdict =
+    verdictEvt && 'approved' in verdictEvt ? (verdictEvt.approved ? 'APPROVED' : 'CHANGES') : '—';
+  const outcome = endEvt && 'outcome' in endEvt ? endEvt.outcome.toUpperCase() : '—';
+
+  const bar = '═'.repeat(64);
+  console.log(`╔${bar}╗`);
+  console.log(`║  INTRAHEALTH HARNESS · REPLAY`.padEnd(65) + '║');
+  console.log(`╠${bar}╣`);
+  console.log(`║  Run      ${runId}`.padEnd(65) + '║');
+  console.log(
+    `║  Events   ${events.length}  ·  ${turns}  ·  ${duration}  ·  cost ${cost}`.padEnd(65) + '║',
+  );
+  console.log(`║  Reviewer ${verdict}  ·  outcome ${outcome}`.padEnd(65) + '║');
+  console.log(`╚${bar}╝`);
   console.log('');
   for (const e of events) {
     renderEvent(e);
